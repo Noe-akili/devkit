@@ -9,7 +9,9 @@ import os from 'os';
 import { execa } from 'execa';
 import { createHash } from 'crypto';
 import { randomBytes } from 'crypto';
-import { deflateSync, inflateSync } from 'zlib';
+import { deflateSync, inflateSync, brotliCompressSync, brotliDecompressSync, constants as ZLIB } from 'zlib';
+const BROTLI_PARAM_QUALITY = ZLIB.BROTLI_PARAM_QUALITY;
+const BROTLI_PARAM_SIZE_HINT = ZLIB.BROTLI_PARAM_SIZE_HINT;
 
 const program = new Command();
 const TODO_FILE = path.join(process.cwd(), '.devkit-todo.json');
@@ -282,16 +284,19 @@ todo
   });
 
 // ========== COMMANDE 4 : APPS (conteneur compressé .dk) ==========
-// Format .dk v1 — binaire, accès aléatoire, extraction instantanée par fichier.
+// Format .dk v2 — conteneur binaire auto-adaptatif.
 //   [0..4)   magic "DKPK"
-//   [4)      version = 1
+//   [4)      version (1 | 2)
 //   [5..9)   headerSize uint32 LE
-//   [9..9+N) header JSON (manifest + index des fichiers)
-//   [9+N..)  payload : flux zlib déflatés, un par fichier (offsets dans le header)
+//   [9..9+N) header JSON (manifest + index + table des chunks)
+//   [9+N..)  payload : chunks compressés DÉDUPLIQUÉS, un par contenu unique
+// v2 ajoute : dédup par hash de contenu, brotli/zlib/raw auto, manifest riche.
 const IGNORE_DIRS = ['node_modules', '.git', 'dist', 'build', '.next', '.nuxt', 'coverage', '.cache', 'target', '__pycache__', '.venv', 'vendor', '.turbo', 'out'];
 const DK_MAGIC = Buffer.from('DKPK');
-const DK_VERSION = 1;
-const COMPRESSION_LEVEL = 9;
+const DK_VERSION = 2;
+const SUPPORTED_VERSIONS = new Set([1, 2]);
+const ZLIB_LEVEL = 9;
+const BROTLI_QUALITY = 9;
 const EXTRACT_CONCURRENCY = 16;
 
 function ensureDirs() { fs.mkdirSync(APPS_DIR, { recursive: true }); }
@@ -340,6 +345,17 @@ function detectCommands(dir) {
   }
   return out;
 }
+function projectMeta(dir) {
+  const pkg = readPackage(dir) || {};
+  const deps = [];
+  for (const [n, v] of Object.entries({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) })) deps.push({ n, v });
+  return {
+    description: pkg.description || '',
+    license: pkg.license || '',
+    author: typeof pkg.author === 'object' ? (pkg.author.name || '') : (pkg.author || ''),
+    deps: deps.slice(0, 50),
+  };
+}
 function sourceInfo(source) {
   if (/^(https?:\/\/|git@|git:\/\/)/.test(source)) {
     return { type: 'git', url: source, defaultName: source.replace(/\.git$/, '').split(/[\/:]/).pop() };
@@ -348,30 +364,61 @@ function sourceInfo(source) {
   return null;
 }
 
-// ---------- PACK : build d'un .dk ----------
+// ---------- COMPRESSION ADAPTATIVE ----------
+function isBinary(buf) { return buf.subarray(0, 4096).includes(0); }
+function compressChunk(buf) {
+  if (!isBinary(buf) && buf.length >= 8) {
+    const b = brotliCompressSync(buf, { params: { [BROTLI_PARAM_QUALITY]: BROTLI_QUALITY, [BROTLI_PARAM_SIZE_HINT]: buf.length } });
+    if (b.length < buf.length * 0.9) return { comp: 'brotli', buf: b };
+  }
+  const z = deflateSync(buf, { level: ZLIB_LEVEL });
+  if (z.length < buf.length * 0.98) return { comp: 'zlib', buf: z };
+  return { comp: 'raw', buf };
+}
+function decompressChunk(chunk, buf) {
+  if (chunk.comp === 'brotli') return brotliDecompressSync(buf);
+  if (chunk.comp === 'zlib') return inflateSync(buf);
+  return buf;
+}
+
+// ---------- PACK : build d'un .dk v2 ----------
 function packProject(sourcePath, meta) {
   const files = fg.sync(['**/*'], { cwd: sourcePath, dot: true, onlyFiles: true, ignore: IGNORE_DIRS.map(d => `${d}/**`), suppressErrors: true });
+  const chunkIndex = new Map();
   const chunks = [];
+  const chunkBufs = [];
   const entries = [];
   let offset = 0;
   let usize = 0;
   for (const rel of files) {
     let buf;
     try { buf = fs.readFileSync(path.join(sourcePath, rel)); } catch { continue; }
-    const comp = deflateSync(buf, { level: COMPRESSION_LEVEL });
-    entries.push({ p: rel, o: offset, c: comp.length, u: buf.length, h: createHash('sha256').update(buf).digest('hex') });
-    chunks.push(comp);
-    offset += comp.length;
+    const h = createHash('sha256').update(buf).digest('hex');
     usize += buf.length;
+    let chunk = chunkIndex.get(h);
+    if (chunk === undefined) {
+      const { comp, buf: cb } = compressChunk(buf);
+      chunk = chunks.length;
+      chunks.push({ comp, o: offset, c: cb.length, u: buf.length });
+      chunkBufs.push(cb);
+      offset += cb.length;
+      chunkIndex.set(h, chunk);
+    }
+    entries.push({ p: rel, chunk, u: buf.length, h });
   }
-  const payload = Buffer.concat(chunks);
+  const payload = Buffer.concat(chunkBufs);
+  const m = projectMeta(sourcePath);
   const header = {
     magic: 'DKPK', version: DK_VERSION, formatVersion: DK_VERSION, format: 'devkit-package',
     name: meta.name, type: meta.type, source: meta.source,
     version: meta.version || '0.0.0',
-    fileCount: entries.length, usize, csize: payload.length,
+    description: m.description, license: m.license, author: m.author,
+    deps: m.deps,
+    fileCount: entries.length, chunkCount: chunks.length, usize, csize: payload.length,
     payloadHash: createHash('sha256').update(payload).digest('hex'),
-    createdAt: new Date().toISOString(), files: entries,
+    builder: { name: 'devkit', node: process.version, platform: `${os.platform()}-${os.arch()}` },
+    createdAt: new Date().toISOString(),
+    chunks, files: entries,
   };
   const headerJson = Buffer.from(JSON.stringify(header), 'utf-8');
   const out = Buffer.alloc(9 + headerJson.length + payload.length);
@@ -392,7 +439,7 @@ function readHeader(dkFile) {
     if (!magic.equals(DK_MAGIC)) throw new Error('Fichier .dk invalide (magic inattendu)');
     const ver = Buffer.alloc(1);
     fs.readSync(fd, ver, 0, 1, 4);
-    if (ver[0] !== DK_VERSION) throw new Error(`Version .dk non supportée: ${ver[0]}`);
+    if (!SUPPORTED_VERSIONS.has(ver[0])) throw new Error(`Version .dk non supportée: ${ver[0]}`);
     const hlenBuf = Buffer.alloc(4);
     fs.readSync(fd, hlenBuf, 0, 4, 5);
     const hlen = hlenBuf.readUInt32LE(0);
@@ -400,19 +447,37 @@ function readHeader(dkFile) {
     fs.readSync(fd, hbuf, 0, hlen, 9);
     const header = JSON.parse(hbuf.toString('utf-8'));
     header._payloadStart = 9 + hlen;
+    header._legacy = ver[0] === 1;
     return header;
   } finally { fs.closeSync(fd); }
 }
-function extractFile(dkFile, header, entry, dest) {
+function readPayloadChunk(dkFile, header, chunk) {
   const fd = fs.openSync(dkFile, 'r');
   try {
-    const buf = Buffer.alloc(entry.c);
-    fs.readSync(fd, buf, 0, entry.c, header._payloadStart + entry.o);
-    const raw = inflateSync(buf);
-    const to = path.join(dest, entry.p);
-    fs.mkdirSync(path.dirname(to), { recursive: true });
-    fs.writeFileSync(to, raw);
+    const buf = Buffer.alloc(chunk.c);
+    fs.readSync(fd, buf, 0, chunk.c, header._payloadStart + chunk.o);
+    return decompressChunk(chunk, buf);
   } finally { fs.closeSync(fd); }
+}
+async function extractAll(dkFile, header, dest) {
+  if (header._legacy) {
+    await mapConcurrent(header.files, EXTRACT_CONCURRENCY, async (e) => {
+      const raw = readPayloadChunk(dkFile, header, { comp: 'zlib', o: e.o, c: e.c });
+      const to = path.join(dest, e.p);
+      await fs.promises.mkdir(path.dirname(to), { recursive: true });
+      await fs.promises.writeFile(to, raw);
+    });
+    return;
+  }
+  const raws = new Array(header.chunks.length);
+  await mapConcurrent(header.chunks.map((ch, i) => ({ ch, i })), EXTRACT_CONCURRENCY, async ({ ch, i }) => {
+    raws[i] = readPayloadChunk(dkFile, header, ch);
+  });
+  await mapConcurrent(header.files, EXTRACT_CONCURRENCY, async (e) => {
+    const to = path.join(dest, e.p);
+    await fs.promises.mkdir(path.dirname(to), { recursive: true });
+    await fs.promises.writeFile(to, raws[e.chunk]);
+  });
 }
 async function ensureExtracted(dkFile, header, spinner) {
   const dest = cacheDirFor(header.name);
@@ -421,7 +486,7 @@ async function ensureExtracted(dkFile, header, spinner) {
   spinner && spinner.set('Extraction (cache à jour)...');
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
-  await mapConcurrent(header.files, EXTRACT_CONCURRENCY, e => extractFile(dkFile, header, e, dest));
+  await extractAll(dkFile, header, dest);
   fs.writeFileSync(stamp, header.payloadHash);
   return dest;
 }
@@ -481,14 +546,19 @@ program
       spinner.stop(`✅ Empaqueté en ${((Date.now() - t0) / 1000).toFixed(2)}s`);
 
       const ratio = header.usize ? Math.round((1 - header.csize / header.usize) * 100) : 0;
+      const breakdown = { brotli: 0, zlib: 0, raw: 0 };
+      (header.chunks || []).forEach(ch => breakdown[ch.comp]++);
+      const dedup = header.chunkCount ? header.fileCount - header.chunkCount : 0;
       const lines = [
         `  📦 Fichier:  ${c.accent(path.basename(outFile))}  ${c.dim('v' + header.version)}`,
-        `  🧩 Contenu:  ${chalk.white(header.fileCount)} fichiers  ${c.dim((header.usize / 1024 / 1024).toFixed(2) + ' MB → ' + (header.csize / 1024 / 1024).toFixed(2) + ' MB')}`,
+        `  🧩 Contenu:  ${chalk.white(header.fileCount)} fichiers  ${c.dim('(' + (header.usize / 1024 / 1024).toFixed(2) + ' MB → ' + (header.csize / 1024 / 1024).toFixed(2) + ' MB)')}`,
         `  🗜️  Compression: ${c.success(ratio + '%')}  ${c.dim('sha256:' + header.payloadHash.slice(0, 12))}`,
-        `  🧬 Source:   ${c.dim(header.source)}`,
+        `  🧬 Déduplication: ${chalk.white(dedup)} fichier(s) identique(s) en moins (${header.chunkCount} chunks uniques)`,
+        `  🧪 Codec:    ${c.info('brotli:' + breakdown.brotli)} ${c.info('zlib:' + breakdown.zlib)} ${c.dim('raw:' + breakdown.raw)}`,
+        `  📦 Source:   ${c.dim(header.source)}`,
       ];
       if (cmds.run) lines.push(`  ⚙️  Lancement: ${c.info(cmds.run.cmd + ' ' + cmds.run.args.join(' '))}`);
-      console.log(box('✅ Package .dk créé', lines, { color: chalk.green, rounded: true }));
+      console.log(box('✅ Package .dk v2 créé', lines, { color: chalk.green, rounded: true }));
       hint(`Lancer: ${c.accent('devkit run ' + name)}   Détails: ${c.accent('devkit info ' + name)}`);
     } catch (e) {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -530,15 +600,21 @@ program
     try { h = readHeader(file); } catch (e) { return console.log(c.error(`\n  ✗ ${e.message}\n`)); }
     const ok = verifyDk(file, h);
     const ratio = h.usize ? Math.round((1 - h.csize / h.usize) * 100) : 0;
+    const codecs = h.chunks ? h.chunks.reduce((a, ch) => (a[ch.comp]++, a), { brotli: 0, zlib: 0, raw: 0 }) : { brotli: 0, zlib: h.fileCount, raw: 0 };
     const lines = [
       `  📛 App:       ${c.accent(h.name)}  ${c.dim('v' + h.version)}`,
       `  📦 Fichier:   ${c.dim(path.basename(file))}`,
       `  🧬 Source:    ${c.dim(h.source)}`,
       `  🗜️  Format:    ${c.info('.dk v' + h.formatVersion)}  ${c.dim(h.format)}`,
-      `  🧩 Contenu:   ${chalk.white(h.fileCount)} fichiers  ${c.dim('(' + (h.usize / 1024 / 1024).toFixed(2) + ' MB → ' + (h.csize / 1024 / 1024).toFixed(2) + ' MB, ' + ratio + '% de compression)')}`,
+      `  🧩 Contenu:   ${chalk.white(h.fileCount)} fichiers / ${chalk.white(h.chunkCount || h.fileCount)} chunks  ${c.dim('(' + (h.usize / 1024 / 1024).toFixed(2) + ' MB → ' + (h.csize / 1024 / 1024).toFixed(2) + ' MB, ' + ratio + '% de compression)')}`,
+      `  🧪 Codec:     ${c.info('brotli:' + codecs.brotli)} ${c.info('zlib:' + codecs.zlib)} ${c.dim('raw:' + codecs.raw)}`,
+      `  🏗️  Builder:   ${c.dim('devkit sur ' + (h.builder ? h.builder.platform : '?') + ' (node ' + (h.builder ? h.builder.node : '?') + ')')}`,
       `  🔒 Intégrité: ${ok ? c.success('✓ sha256:' + h.payloadHash) : c.error('✗ CORROMPU')}`,
       `  🕒 Créé le:   ${c.dim(new Date(h.createdAt).toLocaleString())}`,
     ];
+    if (h.description) lines.push(`  📝 Description: ${c.dim(h.description)}`);
+    if (h.license) lines.push(`  ⚖️  Licence:   ${c.dim(h.license)}`);
+    if (h.deps && h.deps.length) lines.push(`  📚 Dépendances: ${c.dim(h.deps.length + ' paquets')}`);
     const top = h.files.slice().sort((a, b) => b.u - a.u).slice(0, 5);
     if (top.length) {
       lines.push('');
