@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import chalk from 'chalk';
-import Table from 'cli-table3';
-import fg from 'fast-glob';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execa } from 'execa';
-import { createHash } from 'crypto';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { deflateSync, inflateSync, brotliCompressSync, brotliDecompressSync, constants as ZLIB } from 'zlib';
 const BROTLI_PARAM_QUALITY = ZLIB.BROTLI_PARAM_QUALITY;
 const BROTLI_PARAM_SIZE_HINT = ZLIB.BROTLI_PARAM_SIZE_HINT;
+
+async function loadTable() { return (await import('cli-table3')).default; }
+async function loadFg() { return (await import('fast-glob')).default; }
+async function loadExeca() { return (await import('execa')).execa; }
 
 const program = new Command();
 const TODO_FILE = path.join(process.cwd(), '.devkit-todo.json');
@@ -144,6 +145,7 @@ program
       `  📏 Profondeur: ${c.accent(options.depth)}`,
     ], { color: chalk.cyan, rounded: true }));
     const spinner = createSpinner('Analyse en cours...');
+    const fg = await loadFg();
     const stats = {};
     let totalLines = 0;
     let totalSize = 0;
@@ -167,6 +169,7 @@ program
     }
     spinner.stop(`✅ ${fileCount} fichiers analysés`);
 
+    const Table = await loadTable();
     const table = new Table({
       head: [c.info('Extension'), c.info('Fichiers'), c.info('Taille')],
       style: { head: [], border: [], 'padding-left': 1, 'padding-right': 1 },
@@ -214,6 +217,7 @@ vue
     ], { color: chalk.magenta, rounded: true }));
     const template = options.ts ? 'vue-ts' : 'vue';
     const spinner = createSpinner('Création du projet Vite...');
+    const execa = await loadExeca();
     await execa('npm', ['create', 'vite@latest', name, '--', '--template', template], { stdio: 'inherit' });
     const projectPath = path.join(process.cwd(), name);
     spinner.set('Installation des dépendances...');
@@ -330,20 +334,32 @@ function readPackage(dir) {
 }
 function detectCommands(dir) {
   const pkg = readPackage(dir);
-  const out = { run: null, build: null, version: '0.0.0', packageManager: 'npm' };
+  const out = { run: null, build: null, version: '0.0.0', packageManager: 'npm', needDeps: false };
   if (pkg) {
     out.version = pkg.version || '0.0.0';
+    out.needDeps = Object.keys(pkg.dependencies || {}).length + Object.keys(pkg.devDependencies || {}).length > 0;
     if (pkg.bin) {
       const bin = typeof pkg.bin === 'string' ? pkg.bin : Object.values(pkg.bin)[0];
       out.run = { cmd: 'node', args: [path.join(dir, bin)] };
-    } else if (pkg.scripts && pkg.scripts.start) out.run = { cmd: 'npm', args: ['run', 'start'] };
-    else if (pkg.scripts && pkg.scripts.dev) out.run = { cmd: 'npm', args: ['run', 'dev'] };
+    } else if (pkg.scripts && pkg.scripts.start) {
+      const m = pkg.scripts.start.trim().match(/^node\s+(.+)$/);
+      if (m) out.run = { cmd: 'node', args: m[1].split(/\s+/) };
+      else out.run = { cmd: 'npm', args: ['run', 'start'] };
+    } else if (pkg.scripts && pkg.scripts.dev) {
+      const m = pkg.scripts.dev.trim().match(/^node\s+(.+)$/);
+      if (m) out.run = { cmd: 'node', args: m[1].split(/\s+/) };
+      else out.run = { cmd: 'npm', args: ['run', 'dev'] };
+    }
     if (pkg.scripts && pkg.scripts.build) out.build = { cmd: 'npm', args: ['run', 'build'] };
   }
   for (const entry of ['index.js', 'main.js', 'app.js', 'server.js']) {
     if (!out.run && fs.existsSync(path.join(dir, entry))) out.run = { cmd: 'node', args: [entry] };
   }
   return out;
+}
+function shellString(run) {
+  if (!run) return null;
+  return run.cmd + ' ' + run.args.map(a => /\s/.test(a) ? `"${a}"` : a).join(' ');
 }
 function projectMeta(dir) {
   const pkg = readPackage(dir) || {};
@@ -382,7 +398,8 @@ function decompressChunk(chunk, buf) {
 }
 
 // ---------- PACK : build d'un .dk v2 ----------
-function packProject(sourcePath, meta) {
+async function packProject(sourcePath, meta) {
+  const fg = await loadFg();
   const files = fg.sync(['**/*'], { cwd: sourcePath, dot: true, onlyFiles: true, ignore: IGNORE_DIRS.map(d => `${d}/**`), suppressErrors: true });
   const chunkIndex = new Map();
   const chunks = [];
@@ -487,8 +504,22 @@ async function ensureExtracted(dkFile, header, spinner) {
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
   await extractAll(dkFile, header, dest);
+  const cmds = detectCommands(dest);
+  fs.writeFileSync(path.join(dest, '.dk-manifest'), JSON.stringify({
+    version: cmds.version, needDeps: cmds.needDeps,
+    run: cmds.run ? shellString(cmds.run) : null,
+    build: cmds.build ? shellString(cmds.build) : null,
+  }));
   fs.writeFileSync(stamp, header.payloadHash);
   return dest;
+}
+function loadManifest(dir) {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(dir, '.dk-manifest'), 'utf-8'));
+    if (m.run) return m;
+  } catch { /* ignore */ }
+  const cmds = detectCommands(dir);
+  return { version: cmds.version, needDeps: cmds.needDeps, run: cmds.run ? shellString(cmds.run) : null };
 }
 function verifyDk(dkFile, header) {
   const fd = fs.openSync(dkFile, 'r');
@@ -503,6 +534,7 @@ function verifyDk(dkFile, header) {
 async function fetchSource(src, tmp, spinner) {
   if (src.type === 'git') {
     spinner && spinner.set('Clonage du dépôt (shallow)...');
+    const execa = await loadExeca();
     await execa('git', ['clone', '--depth', '1', '--quiet', src.url, tmp], { stdio: 'inherit' });
     return tmp;
   }
@@ -511,6 +543,7 @@ async function fetchSource(src, tmp, spinner) {
 }
 async function installDeps(dir, spinner) {
   spinner && spinner.set('Installation des dépendances (npm install)...');
+  const execa = await loadExeca();
   await execa('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir, stdio: 'inherit' });
 }
 
@@ -537,7 +570,7 @@ program
       const srcDir = await fetchSource(src, tmp, spinner);
       const cmds = detectCommands(srcDir);
       spinner.set('Compression des sources (niveau 9)...');
-      const { buffer, header } = packProject(srcDir, { name, type: src.type, source: src.type === 'git' ? src.url : src.path, version: cmds.version });
+      const { buffer, header } = await packProject(srcDir, { name, type: src.type, source: src.type === 'git' ? src.url : src.path, version: cmds.version });
       fs.mkdirSync(path.dirname(outFile), { recursive: true });
       const tmpOut = `${outFile}.part-${randomBytes(3).toString('hex')}`;
       fs.writeFileSync(tmpOut, buffer);
@@ -642,7 +675,7 @@ program
     console.log('\n' + box('🛡️  Vérification des packages', lines, { color: chalk.green, rounded: true }) + '\n');
   });
 
-// ---------- COMMANDE run : extraction + lancement ----------
+// ---------- COMMANDE run : extraction + lancement ultra-rapide ----------
 program
  .command('run')
  .description('Extraire et lancer une app .dk')
@@ -654,19 +687,21 @@ program
     if (!fs.existsSync(file)) return console.log(c.error(`\n  ✗ App "${name}" introuvable. Utilise: ${c.accent('devkit list')}\n`));
     let h;
     try { h = readHeader(file); } catch (e) { return console.log(c.error(`\n  ✗ ${e.message}\n`)); }
-    const spinner = createSpinner('Préparation du runtime...');
-    const dir = await ensureExtracted(file, h, spinner);
-    const cmds = detectCommands(dir);
-    if (cmds.run && options.install && !fs.existsSync(path.join(dir, 'node_modules'))) await installDeps(dir, spinner);
-    spinner.stop();
-    if (!cmds.run) return console.log(c.error(`\n  ✗ Aucune commande de lancement détectée dans ${c.dim(h.name)}\n`));
+    const dir = await ensureExtracted(file, h, null);
+    const manifest = loadManifest(dir);
+    if (manifest.run && options.install && manifest.needDeps && !fs.existsSync(path.join(dir, 'node_modules'))) {
+      await installDeps(dir, createSpinner('Installation des dépendances...'));
+    }
+    if (!manifest.run) return console.log(c.error(`\n  ✗ Aucune commande de lancement détectée dans ${c.dim(h.name)}\n`));
+    const full = [manifest.run, ...args].join(' ');
     console.log(box('🚀 Lancement', [
       `  📛 App:      ${c.accent(h.name)}  ${c.dim('v' + h.version)}`,
       `  🗜️  Package:  ${c.dim(path.basename(file))}  ${c.dim('(' + h.fileCount + ' fichiers)')}`,
-      `  📂 Runtime:  ${c.dim(dir)}`,
-      `  ⚙️  Commande: ${c.info(cmds.run.cmd + ' ' + [...cmds.run.args, ...args].join(' '))}`,
+      `  ⚙️  Commande: ${c.info(full)}`,
     ], { color: chalk.blue, rounded: true }));
-    await execa(cmds.run.cmd, [...cmds.run.args, ...args], { cwd: dir, stdio: 'inherit' });
+    const res = spawnSync(full, { cwd: dir, stdio: 'inherit', shell: true });
+    if (res.error) console.log(c.error(`\n  ✗ Erreur: ${res.error.message}\n`));
+    process.exitCode = typeof res.status === 'number' ? res.status : 1;
   });
 
 // ---------- COMMANDE update : re-packer depuis la source ----------
@@ -688,7 +723,7 @@ program
       const srcDir = await fetchSource(srcInfo, tmp, spinner);
       const cmds = detectCommands(srcDir);
       spinner.set('Re-compression...');
-      const { buffer, header } = packProject(srcDir, { name, type: old.type, source: old.source, version: cmds.version });
+      const { buffer, header } = await packProject(srcDir, { name, type: old.type, source: old.source, version: cmds.version });
       const tmpOut = `${file}.part-${randomBytes(3).toString('hex')}`;
       fs.writeFileSync(tmpOut, buffer);
       fs.renameSync(tmpOut, file);
